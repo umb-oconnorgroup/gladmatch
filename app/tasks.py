@@ -1,43 +1,97 @@
+from email.mime.text import MIMEText
+import json
 import os
-import tempfile
-import uuid
+import smtplib
+import ssl
+import subprocess
 
 from celery import Celery
-import dask.array as da
-import numpy as np
-from scipy.optimize import linear_sum_assignment
-from scipy.spatial.distance import cdist
+import yaml
 
-pca_path = os.path.join(os.path.abspath(os.path.dirname(__file__)), "static/data/Freeze1.imputed_above0.9.missing0.001.nodups_202106.sorted.biallelic.pruned_at0.5.filtered.pca.applied_to_all.npy")
-explained_variance_ratio_path = os.path.join(os.path.abspath(os.path.dirname(__file__)), "static/data/Freeze1.imputed_above0.9.missing0.001.nodups_202106.sorted.biallelic.pruned_at0.5.filtered.explained_variance_ratio.npy")
-zarr_path = os.path.join(os.path.abspath(os.path.dirname(__file__)), "static/data/Freeze1.imputed_above0.9.missing0.001.nodups_202106.sorted.biallelic.pruned_at0.5.zarr")
-glad_pca = np.load(pca_path)
-explained_variance_ratio = np.load(explained_variance_ratio_path)
-glad_genotypes = da.from_zarr(os.path.join(zarr_path, "call_genotype"))
-glad_chromosomes = (da.from_zarr(os.path.join(zarr_path, "variant_contig")) + 1).compute()
-glad_positions = da.from_zarr(os.path.join(zarr_path, "variant_position")).compute()
-#
-abridged_genotypes_path = os.path.join(os.path.abspath(os.path.dirname(__file__)), "static/data/Freeze1.imputed_above0.9.missing0.001.nodups_202106.sorted.biallelic.pruned_at0.5.genotypes.abridged.npy")
-abridged_genotypes = np.load(abridged_genotypes_path)
-#
+
+with open(os.path.join(os.path.abspath(os.path.dirname(__file__)), "config.yaml"), "r") as config_file:
+    config = yaml.safe_load(config_file)
+
 
 app = Celery('tasks', backend="redis://localhost", broker="pyamqp://")
 
-def match_query(embedding, query_embedding, metric="euclidean", weights=None):
-    kwargs = {}
-    if metric == "wminkowski":
-        kwargs["w"] = weights
-    distances = cdist(query_embedding, embedding, metric=metric, **kwargs)
-    return np.array(linear_sum_assignment(distances)[1])
+@app.on_after_configure.connect
+def setup_periodic_tasks(sender, **kwargs):
+    sender.add_periodic_task(60.0, scan_tasks.s(), expires=30)
 
 @app.task
-def match(file_id):
-    query_pca = np.load(os.path.join(tempfile.gettempdir(), file_id))
-    # match_indices = match_query(glad_pca, query_pca, metric="wminkowski", weights=explained_variance_ratio)
-    # match_allele_frequencies = (glad_genotypes[:, match_indices].sum(-1).sum(-1) / (glad_genotypes.shape[1] * glad_genotypes.shape[2])).compute()
-    # abridged for ram limitation
-    match_indices = match_query(glad_pca[:abridged_genotypes.shape[0]], query_pca, metric="wminkowski", weights=explained_variance_ratio)
-    match_allele_frequencies = abridged_genotypes[:, match_indices].sum(-1).sum(-1) / (abridged_genotypes.shape[1] * abridged_genotypes.shape[2])
-    result_file_id = str(uuid.uuid1())
-    np.savez_compressed(os.path.join(tempfile.gettempdir(), result_file_id), chromosomes=glad_chromosomes, positions=glad_positions, minor_allele_frequencies=match_allele_frequencies)
-    return result_file_id
+def scan_tasks():
+    task_data_dir = config["tasks"]["data_dir"]
+    for task_id in os.listdir(task_data_dir):
+        task_result = app.AsyncResult(task_id)
+        if task_result.state == "PENDING":
+            match.apply_async((task_id,), task_id=task_id)
+            continue
+        elif task_result.state == "SUCCESS":
+            if app.AsyncResult("notif" + task_id[:-5]).state == "PENDING":
+                job_id = task_result.result
+                process = subprocess.run(["qstat", "-j", job_id], capture_output=True)
+                if process.stderr.decode().startswith("Following jobs do not exist"):
+                    notify.apply_async((task_id,), task_id="notif" + task_id[:-5])
+                continue
+
+@app.task
+def notify(task_id):
+    port = 465
+    smtp_server = "smtp.gmail.com"
+    sender_email = config["email"]["address"]
+    password = config["email"]["password"]
+    task_data_dir = config["tasks"]["data_dir"]
+    with open(os.path.join(task_data_dir, task_id, "params.json"), "r") as params_file:
+        receiver_email = json.load(params_file)["email"]
+
+    if "match.vcf" in os.listdir(os.path.join(task_data_dir, task_id)):
+        subject = "Subject: GLADdb Matching Complete - {}".format(task_id)
+        body = """The matching task you submitted has completed successfully.
+        You can download the results using the following link:
+        https://gladdb.igs.umaryland.edu/tasks/{}""".format(task_id)
+    else:
+        subject = "Subject: GLADdb Matching Failed - {}".format(task_id)
+        body = """The matching task you submitted has failed."""
+    
+    msg = MIMEText(body)
+    msg["Subject"] = subject
+    msg["From"] = sender_email
+    msg["To"] = receiver_email
+
+    context = ssl.create_default_context()
+    with smtplib.SMTP_SSL(smtp_server, port, context=context) as server:
+        server.login(sender_email, password)
+        server.sendmail(sender_email, receiver_email, msg.as_string())
+
+
+@app.task
+def match(task_id):
+    bash_script_path = os.path.join(os.path.abspath(os.path.dirname(__file__)), "match.sh")
+    python_script_path = os.path.join(os.path.abspath(os.path.dirname(__file__)), "match.py")
+    task_dir = os.path.join(config["tasks"]["data_dir"], task_id)
+    query_path = os.path.join(task_dir, "query.npz")
+    result_path = os.path.join(task_dir, "match.vcf")
+    with open(os.path.join(task_dir, "params.json"), "r") as params_file:
+        params = json.load(params_file)
+        if params["n"] == "":
+            n = "-1"
+        else:
+            try:
+                n = int(params["n"])
+                n = str(n)
+            except:
+                n = "-1"
+        exclude_phs = params["exclude-phs"]
+        if "self-described" in params:
+            self_described = "--self-described"
+        else:
+            self_described = ""
+
+    subprocess.run(["cp", python_script_path, task_dir])
+    process = subprocess.run(["qsub", "-wd", task_dir, bash_script_path, "match.py", query_path, result_path, n, exclude_phs, self_described], capture_output=True)
+    if process.stdout.decode().startswith("Your job"):
+        # return job id
+        return process.stdout.decode().split()[2]
+    else:
+        raise ValueError("Unexpected qsub output.\nstdout: {}\nstderr".format(process.stdout.decode(), process.stderr.decode()))

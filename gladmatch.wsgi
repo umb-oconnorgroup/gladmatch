@@ -1,3 +1,3 @@
 import sys
-sys.path.insert(0,'/var/www/html/gladmatch')
+sys.path.insert(0,'/export/gladmatch')
 from app import app as application

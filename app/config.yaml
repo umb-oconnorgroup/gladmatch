@@ -1,0 +1,5 @@
+tasks:
+    data_dir: <data-dir>
+email:
+    address: <email-address>
+    password: <email-password>
