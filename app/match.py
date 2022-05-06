@@ -9,6 +9,7 @@ from scipy.optimize import linear_sum_assignment
 from scipy.spatial.distance import cdist
 from scipy.stats import chi2
 import sgkit as sg
+from sklearn.neighbors import NearestNeighbors
 
 
 @jit(nopython=True)
@@ -51,6 +52,7 @@ def match_query(query_embedding, query_genotype_counts, embedding, dataset, n_ma
     kwargs = {}
     if weights is not None:
         kwargs["w"] = weights
+    # could speed up by directly searching for nearest neighbors instead of first computing distances
     distances = cdist(query_embedding, embedding, metric=metric, **kwargs)
     if exclude_indices is not None and len(exclude_indices) > 0:
         distances[:, exclude_indices] = 1e10
@@ -61,8 +63,54 @@ def match_query(query_embedding, query_genotype_counts, embedding, dataset, n_ma
     genotype_counts = np.zeros((dataset.call_genotype.sizes["variants"], 3), dtype=int)
     for i in range(0, 3):
         genotype_counts[:, i] = (genotypes == i).sum(1)
-    quality_score = evaluate_match(query_genotype_counts, genotype_counts)
-    return match_indices, quality_score, genotype_counts
+    current_quality_score = evaluate_match(query_genotype_counts, genotype_counts)
+    #
+    print("Greedy lambda: {}".format(current_quality_score))
+    n_neighbors = 5
+    n_swap_indices = n_matches // 20 if n_matches >= 20 else 1
+    n_iterations = 200
+    initial_temperature = .002
+    candidate_indices, counts = np.unique(distances.argsort(1)[:, :n_neighbors], return_counts=True)
+    while len(candidate_indices) < n_matches:
+        n_neighbors += 1
+        candidate_indices, counts = np.unique(distances.argsort(1)[:, :n_neighbors], return_counts=True)
+        if n_neighbors > 20:
+            raise ValueError("Cannot find sufficient matches with reasonable number of neighbors.")
+    match_index_indices = np.random.choice(np.arange(len(candidate_indices)), size=(n_matches,), replace=False, p=counts / counts.sum())
+    candidate_genotypes = dataset.call_genotype[:, candidate_indices].sum("ploidy").compute().to_numpy()
+    genotype_counts = np.zeros((dataset.call_genotype.sizes["variants"], 3), dtype=int)
+    for i in range(0, 3):
+        genotype_counts[:, i] = (candidate_genotypes[:, match_index_indices] == i).sum(1)
+    current_quality_score = evaluate_match(query_genotype_counts, genotype_counts)
+    print("Simulated annealing init lambda: {}".format(current_quality_score))
+    for i in range(n_iterations):
+        counts_copy = np.copy(counts)
+        counts_copy[match_index_indices] = 0
+        swap_index_indices = np.random.choice(np.arange(len(match_index_indices)), size=(n_swap_indices,), replace=False)
+        swap_indices = match_index_indices[swap_index_indices]
+        counts_copy[swap_indices] = counts[swap_indices]
+        replacement_index_indices = np.random.choice(np.arange(len(candidate_indices)), size=(n_swap_indices,), replace=False, p=counts_copy / counts_copy.sum())
+        mask = np.ones(len(match_index_indices), dtype=bool)
+        mask[swap_index_indices] = False
+        proposed_match_index_indices = np.concatenate([match_index_indices[mask], replacement_index_indices])
+        genotype_counts = np.zeros((dataset.call_genotype.sizes["variants"], 3), dtype=int)
+        for i in range(0, 3):
+            genotype_counts[:, i] = (candidate_genotypes[:, proposed_match_index_indices] == i).sum(1)
+        quality_score = evaluate_match(query_genotype_counts, genotype_counts)
+        print("Simulated annealing iteration lambda: {}".format(quality_score))
+        # temperature = initial_temperature / (1 + i)
+        temperature = initial_temperature / (1 + np.log(1 + i))
+        # temperature = initial_temperature * np.power(.95, i)
+        print(np.exp(-(quality_score - current_quality_score) / temperature))
+        if quality_score < current_quality_score or np.exp(-(quality_score - current_quality_score) / temperature) > np.random.rand():
+            print("ACCEPT")
+            match_index_indices = proposed_match_index_indices
+            current_quality_score = quality_score
+        else:
+            print("REJECT")
+    match_indices = candidate_indices[match_index_indices]
+    #
+    return match_indices, current_quality_score
 
 def build_demographic_data(demography_path, ds):
     columns = ["Cohort", "PHS", "Country", "State", "City", "A", "B", "C", "Sex", "SelfDescribedStatus", "HispanicJustification"]
@@ -107,9 +155,12 @@ def get_ancestry_counts(local_ancestry_path, ds, match_ids):
         ancestry_counts[contig_filter] = chr_ancestry_counts[window_indices]
     return ancestry_counts, population_codes
 
-def write_vcf(match_indices, quality_score, genotype_counts, dataset, demographic_df, ancestry_counts, population_codes, args):
-    genotypes = dataset.call_genotype
-    allele_counts = genotypes[:, match_indices].sum(["ploidy", "samples"]).compute().to_numpy()
+def write_vcf(match_indices, quality_score, dataset, demographic_df, ancestry_counts, population_codes, args):
+    genotypes = dataset.call_genotype[:, match_indices].sum("ploidy").compute().to_numpy()
+    genotype_counts = np.zeros((dataset.call_genotype.sizes["variants"], 3), dtype=int)
+    for i in range(0, 3):
+        genotype_counts[:, i] = (genotypes == i).sum(1)
+    allele_counts = genotypes.sum(-1)
     allele_frequencies = allele_counts / (len(match_indices) * 2)
     chromosomes = [dataset.contigs[contig_index] for contig_index in dataset.variant_contig.compute().to_numpy()]
     positions = dataset.variant_position.compute().to_numpy()
@@ -165,10 +216,10 @@ def match(args):
                     phs = "phs" + phs
                 exclude_indices.extend(demographic_df.index[demographic_df["PHS"].apply(lambda x: x.lower() == phs)].tolist())
     exclude_indices = sorted(list(set(exclude_indices)))
-    match_indices, quality_score, genotype_counts = match_query(query_pca, query_gc, glad_pca, pruned_ds, n_matches=args.n, exclude_indices=exclude_indices, metric="minkowski", weights=explained_variance_ratio)
+    match_indices, quality_score = match_query(query_pca, query_gc, glad_pca, pruned_ds, n_matches=args.n, exclude_indices=exclude_indices, metric="minkowski", weights=explained_variance_ratio)
     demographic_df = demographic_df.iloc[match_indices]
     ancestry_counts, population_codes = get_ancestry_counts(args.local_ancestry_path, ds, demographic_df["Sample ID"].to_numpy().tolist())
-    write_vcf(match_indices, quality_score, genotype_counts, ds, demographic_df, ancestry_counts, population_codes, args)
+    write_vcf(match_indices, quality_score, ds, demographic_df, ancestry_counts, population_codes, args)
     return quality_score
 
 

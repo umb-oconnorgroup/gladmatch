@@ -22,4 +22,4 @@ exclude_phs=$5
 self_described=$6
 export PATH=/local/devel/glad/miniconda3/envs/gladmatch/bin:$PATH
 export LD_LIBRARY_PATH=/local/devel/glad/miniconda3/envs/gladmatch/lib:$LD_LIBRARY_PATH
-python3 ${script_path} ${pca_path} ${explained_variance_ratio_path} ${zarr_path} ${pruned_zarr_path} ${query_path} ${demography_path} ${local_ancestry_path} ${result_path} -n ${n} ${self_described} --exclude-phs ${exclude_phs} ${self_described}
+python3 ${script_path} ${pca_path} ${explained_variance_ratio_path} ${zarr_path} ${pruned_zarr_path} ${query_path} ${demography_path} ${local_ancestry_path} ${result_path} -n ${n} ${self_described} --exclude-phs ${exclude_phs}
