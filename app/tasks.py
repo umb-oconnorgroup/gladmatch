@@ -69,6 +69,7 @@ def notify(task_id):
 def match(task_id):
     bash_script_path = os.path.join(os.path.abspath(os.path.dirname(__file__)), "match.sh")
     python_script_path = os.path.join(os.path.abspath(os.path.dirname(__file__)), "match.py")
+    config_path = os.path.join(os.path.abspath(os.path.dirname(__file__)), "config.yaml")
     task_dir = os.path.join(config["tasks"]["data_dir"], task_id)
     query_path = os.path.join(task_dir, "query.npz")
     result_path = os.path.join(task_dir, "match.vcf")
@@ -89,7 +90,8 @@ def match(task_id):
             self_described = ""
 
     subprocess.run(["cp", python_script_path, task_dir])
-    process = subprocess.run(["qsub", "-wd", task_dir, bash_script_path, "match.py", query_path, result_path, n, exclude_phs, self_described], capture_output=True)
+    subprocess.run(["cp", config_path, task_dir])
+    process = subprocess.run(["qsub", "-wd", task_dir, bash_script_path, "match.py", "config.yaml", query_path, result_path, n, exclude_phs, self_described], capture_output=True)
     if process.stdout.decode().startswith("Your job"):
         # return job id
         return process.stdout.decode().split()[2]

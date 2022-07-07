@@ -1,3 +1,11 @@
+paths:
+    pca: <pca-path>
+    explained_variance_ratio: <explained-variance-ratio-path>
+    zarr: <zarr-path>
+    pruned_zarr: <pruned-zarr-path>
+    demography: <demography-path>
+    local_ancestry: <local-ancestry-path>
+    local_ancestry_references: <local-ancestry-references-path>
 tasks:
     data_dir: <data-dir>
 email:
